@@ -145,40 +145,40 @@ function App() {
     return (
       <div className="bg-gray-50 min-h-screen flex flex-col font-sans">
         <header className="bg-white border-b px-4 py-3 flex items-center justify-between shadow-sm sticky top-0 z-10 w-full backdrop-blur-md bg-opacity-70">
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center space-x-3">
             <ClipboardList className="text-blue-600" size={20} />
             <h1 className="font-bold text-lg text-gray-800">Batch Check Results</h1>
+            {allBatchDone && (
+              <button
+                onClick={async () => {
+                  const results = batchResults.map(r => r.result).filter((r): r is CheckResult => !!r);
+                  const bibContent = generateBibFileContent(results);
+                  const success = await copyBibToClipboard(bibContent);
+                  if (success) {
+                    setCopySuccess(true);
+                    setTimeout(() => setCopySuccess(false), 2000);
+                  }
+                }}
+                className="px-3 py-1.5 bg-gray-600 hover:bg-gray-700 text-white font-medium rounded-lg transition-colors flex items-center space-x-1.5 text-sm"
+              >
+                {copySuccess ? <Check size={14} /> : <Copy size={14} />}
+                <span>{copySuccess ? 'Copied!' : 'Copy .bib'}</span>
+              </button>
+            )}
           </div>
           <div className="flex items-center space-x-2">
             {allBatchDone && (
-              <>
-                <button
-                  onClick={() => {
-                    const results = batchResults.map(r => r.result).filter((r): r is CheckResult => !!r);
-                    const bibContent = generateBibFileContent(results);
-                    downloadBibFile(bibContent, 'corrected_references.bib');
-                  }}
-                  className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg transition-colors flex items-center space-x-2"
-                >
-                  <Download size={16} />
-                  <span>Download .bib</span>
-                </button>
-                <button
-                  onClick={async () => {
-                    const results = batchResults.map(r => r.result).filter((r): r is CheckResult => !!r);
-                    const bibContent = generateBibFileContent(results);
-                    const success = await copyBibToClipboard(bibContent);
-                    if (success) {
-                      setCopySuccess(true);
-                      setTimeout(() => setCopySuccess(false), 2000);
-                    }
-                  }}
-                  className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white font-medium rounded-lg transition-colors flex items-center space-x-2"
-                >
-                  {copySuccess ? <Check size={16} /> : <Copy size={16} />}
-                  <span>{copySuccess ? 'Copied!' : 'Copy .bib'}</span>
-                </button>
-              </>
+              <button
+                onClick={() => {
+                  const results = batchResults.map(r => r.result).filter((r): r is CheckResult => !!r);
+                  const bibContent = generateBibFileContent(results);
+                  downloadBibFile(bibContent, 'corrected_references.bib');
+                }}
+                className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg transition-colors flex items-center space-x-2"
+              >
+                <Download size={16} />
+                <span>Download .bib</span>
+              </button>
             )}
             <button
               onClick={() => {
@@ -193,7 +193,7 @@ function App() {
         </header>
 
         <main className="flex-1 p-4 overflow-auto">
-          <div className="max-w-3xl mx-auto space-y-3">
+          <div className="max-w-5xl mx-auto space-y-3">
             {batchResults.map((item, i) => (
               <CheckResultCard key={i} reference={item.ref} result={item.result} loading={item.loading} />
             ))}
