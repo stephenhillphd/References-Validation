@@ -56,6 +56,77 @@ const cleanQuery = (text: string): string => {
         .trim();
 };
 
+/**
+ * Extract the likely title from a full plain-text reference string.
+ * Strips author initials (e.g., "PC", "MS"), page numbers, volume/issue,
+ * years, and other metadata that confuses API search.
+ * 
+ * Example:
+ *   "Produção e uso setorial de tecnologia no Brasil PC Morceiro, MS Tessarin, JJM Guilhoto Economia Aplicada 26 (4), 517-55"
+ *   → "Produção e uso setorial de tecnologia no Brasil"
+ */
+const extractLikelyTitle = (rawRef: string): string | null => {
+    let ref = rawRef.trim();
+    if (!ref || ref.length < 10) return null;
+
+    // Remove page numbers: "517-55", "pp. 123-456", "p. 45"
+    ref = ref.replace(/\b[Pp]{1,2}\.?\s*\d+[-–]\d+/g, '');
+    ref = ref.replace(/\b\d{1,5}\s*[-–]\s*\d{1,5}\b/g, '');
+
+    // Remove volume/issue: "26 (4)", "Vol. 12", "Issue 3", "vol 8, no. 2"
+    ref = ref.replace(/\b[Vv]ol\.?\s*\d+/g, '');
+    ref = ref.replace(/\b[Nn]o\.?\s*\d+/g, '');
+    ref = ref.replace(/\b[Ii]ssue\s*\d+/g, '');
+    ref = ref.replace(/\b\d{1,4}\s*\(\d{1,4}\)/g, '');
+
+    // Remove years: "(2022)", "2022", but only 4-digit years
+    ref = ref.replace(/\(?\b(19|20)\d{2}\b\)?/g, '');
+
+    // Remove DOI patterns
+    ref = ref.replace(/https?:\/\/doi\.org\/[^\s,]+/gi, '');
+    ref = ref.replace(/\bdoi:\s*[^\s,]+/gi, '');
+
+    // Remove standalone author initials (1-3 uppercase letters before a capitalized name)
+    // e.g., "PC Morceiro" → remove "PC", "JJM Guilhoto" → remove "JJM"
+    // This pattern: 1-3 uppercase letters followed by a space and a capitalized word
+    ref = ref.replace(/\b[A-Z]{1,4}\s+(?=[A-Z][a-zà-ö])/g, '');
+
+    // Remove common trailing metadata words often found after the title
+    // Pattern: after removing initials, author last names are capitalized words
+    // We try to detect the boundary by looking for sequences of:
+    //   Capitalized-Word, Capitalized-Word (likely authors or journal)
+    // Strategy: split on commas and take the longest segment that looks like a title
+    const segments = ref.split(/[,;]/)
+        .map(s => s.trim())
+        .filter(s => s.length > 5);
+
+    if (segments.length > 1) {
+        // The title is usually the longest continuous segment, or the first one
+        // that contains mostly lowercase words (not author names)
+        const scored = segments.map(seg => {
+            const words = seg.split(/\s+/);
+            // Count how many words are lowercase (title-like) vs ALL CAPS / Capitalized (author-like)
+            const lowercaseWords = words.filter(w => w.length > 2 && w[0] === w[0].toLowerCase()).length;
+            const ratio = words.length > 0 ? lowercaseWords / words.length : 0;
+            return { seg, score: seg.length * (0.5 + ratio) };
+        });
+        scored.sort((a, b) => b.score - a.score);
+        ref = scored[0].seg;
+    }
+
+    // Final cleanup
+    ref = ref
+        .replace(/\s{2,}/g, ' ')
+        .replace(/^[,;.\s]+|[,;.\s]+$/g, '')
+        .trim();
+
+    // Only return if we got something meaningful (at least 10 chars and different from input)
+    if (ref.length >= 10 && ref.length < rawRef.length * 0.95) {
+        return ref;
+    }
+    return null;
+};
+
 // ===== MINIMUM TITLE SIMILARITY TO ACCEPT A RESULT =====
 // Below this threshold, the result is treated as "Not Found" rather than showing a different paper
 const MIN_TITLE_SIMILARITY = 55;
@@ -636,8 +707,8 @@ const authorsMatch = (source1Authors: string[], source2Authors: string[]): boole
  * If they confirm correct data, provide corrected APA/BibTeX
  */
 export const checkWithFallback = async (query: string, expected?: ExpectedMetadata): Promise<CheckResult> => {
-    // First, try CrossRef
-    const crossRefResult = await checkReference(query, expected);
+    // First, try CrossRef with the full query
+    let crossRefResult = await checkReference(query, expected);
 
     // If not found or low confidence, try fallback sources
     if (!crossRefResult.exists || crossRefResult.matchConfidence < 70 || crossRefResult.issues.length > 0) {
@@ -771,6 +842,20 @@ export const checkWithFallback = async (query: string, expected?: ExpectedMetada
 
         // If nothing found at all (CrossRef also returned NotFound)
         if (!crossRefResult.exists) {
+            // ===== RETRY WITH EXTRACTED TITLE =====
+            // If the full query failed (likely because it contains author names, pages, etc.),
+            // try extracting just the title and searching again
+            if (!expected?.title) {
+                const extractedTitle = extractLikelyTitle(query);
+                if (extractedTitle && extractedTitle !== query) {
+                    console.log(`[Retry] Full query failed, retrying with extracted title: "${extractedTitle}"`);
+                    const retryResult = await checkWithFallback(extractedTitle, expected);
+                    if (retryResult.exists) {
+                        return retryResult;
+                    }
+                }
+            }
+
             return {
                 exists: false,
                 source: 'NotFound',
