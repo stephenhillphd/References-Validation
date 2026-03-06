@@ -155,17 +155,47 @@ const levenshteinDistance = (a: string, b: string): number => {
     return matrix[b.length][a.length];
 };
 
+/**
+ * Word-overlap (Jaccard) similarity — robust to word reordering.
+ * "Produção e uso setorial de tecnologia no Brasil"
+ * vs "Produção e uso de tecnologia setorial no Brasil"
+ * → ~100% instead of ~75% with Levenshtein
+ */
+const wordOverlapSimilarity = (str1: string, str2: string): number => {
+    const words1 = str1.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 0);
+    const words2 = str2.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 0);
+    if (words1.length === 0 || words2.length === 0) return 0;
+
+    const set1 = new Set(words1);
+    const set2 = new Set(words2);
+
+    let intersection = 0;
+    for (const word of set1) {
+        if (set2.has(word)) intersection++;
+    }
+
+    const union = new Set([...set1, ...set2]).size;
+    if (union === 0) return 0;
+
+    return Math.round((intersection / union) * 100);
+};
+
 const calculateSimilarity = (str1: string, str2: string): number => {
     if (!str1 || !str2) return 0;
     const clean1 = str1.toLowerCase().replace(/[^\w\s]/g, '');
     const clean2 = str2.toLowerCase().replace(/[^\w\s]/g, '');
     if (clean1 === clean2) return 100;
 
+    // Levenshtein-based similarity (character-level, penalizes word reordering)
     const distance = levenshteinDistance(clean1, clean2);
     const maxLength = Math.max(clean1.length, clean2.length);
-    if (maxLength === 0) return 0;
+    const levenSim = maxLength === 0 ? 0 : Math.max(0, Math.round((1 - distance / maxLength) * 100));
 
-    return Math.max(0, Math.round((1 - distance / maxLength) * 100));
+    // Word-overlap similarity (word-level, robust to word reordering)
+    const wordSim = wordOverlapSimilarity(str1, str2);
+
+    // Use the best of both — handles both character typos AND word reordering
+    return Math.max(levenSim, wordSim);
 };
 
 // Decode common LaTeX special characters in BibTeX
