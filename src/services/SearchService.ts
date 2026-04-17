@@ -755,19 +755,33 @@ export const checkWithFallback = async (query: string, expected?: ExpectedMetada
         const extractedYears = !expected?.year ? Array.from(extractSource.match(/\b(19|20)\d{2}\b/g) || []) : [];
         const expectedYear = expected?.year || (extractedYears.length > 0 ? String(extractedYears[0]) : undefined);
 
+        // Clean up title for fallback API queries to avoid 400 errors and improve relevance
+        // If CrossRef already found a result, use its perfectly extracted clean title!
+        const fallbackSearchTitle = crossRefResult.exists && crossRefResult.title 
+            ? crossRefResult.title 
+            : (expected?.title ? expected.title : (extractLikelyTitle(query) || title));
 
         // Try Semantic Scholar (pass expectedYear for version-aware selection)
-        const ssResult = await searchSemanticScholar(title, expectedYear);
+        const ssResult = await searchSemanticScholar(fallbackSearchTitle, expectedYear);
 
         if (ssResult) {
             const ssAuthors = ssResult.authors;
-            const ssTitleSim = calculateSimilarity(title, ssResult.title);
+            let ssTitleSim = calculateSimilarity(title, ssResult.title);
+            const normalize = (str: string) => str.toLowerCase().replace(/[^\w\s]/g, '').trim();
+            const nQuery = normalize(title);
+            const nSsTitle = normalize(ssResult.title);
+            if (!expected?.title && nQuery.includes(nSsTitle)) {
+                ssTitleSim = 100;
+            } else if (nQuery.includes(nSsTitle) && ssTitleSim < 95) {
+                ssTitleSim = 95;
+            }
 
-            // If CrossRef wasn't found, OR Semantic Scholar has a significantly better title match
+            // If CrossRef wasn't found, OR Semantic Scholar has a significantly better title match OR it has the correct year version
             const hasBetterTitle = (ssTitleSim >= 95 && ssTitleSim > crossRefResult.titleMatchScore) || 
                                    (ssTitleSim > crossRefResult.titleMatchScore + 10);
+            const hasCorrectVersion = Boolean(expectedYear && ssResult.year?.toString() === expectedYear && ssTitleSim >= 70);
 
-            if (!crossRefResult.exists || (crossRefResult.matchConfidence < 90 && hasBetterTitle)) {
+            if (!crossRefResult.exists || (crossRefResult.matchConfidence < 90 && (hasBetterTitle || hasCorrectVersion))) {
                 if (ssTitleSim < MIN_TITLE_SIMILARITY) {
                     // Title doesn't match well enough — don't show a wrong paper
                     // Continue to try OpenAlex
@@ -803,33 +817,29 @@ export const checkWithFallback = async (query: string, expected?: ExpectedMetada
                     return crossRefResult;
                 }
             }
-
-            // CrossRef found but has version mismatch — check if SS has the right version
-            if (crossRefResult.exists && crossRefResult.issues.some(i => i.toLowerCase().includes('year') || i.toLowerCase().includes('version') || i.toLowerCase().includes('preprint'))) {
-                // If SS has matching year/journal, offer as corrected version
-                if (expectedYear && ssResult.year?.toString() === expectedYear) {
-                    crossRefResult.correctedApa = formatSemanticScholarAPA(ssResult);
-                    crossRefResult.correctedBibtex = generateSemanticScholarBibTeX(ssResult);
-                    crossRefResult.fallbackSource = 'SemanticScholar';
-                    // Boost confidence since another source confirms it
-                    crossRefResult.matchConfidence = Math.min(100, crossRefResult.matchConfidence + 15);
-                    return crossRefResult;
-                }
-            }
         }
 
         // Try OpenAlex (pass expectedYear for version-aware selection)
-        const oaResult = await searchOpenAlex(title, expectedYear);
+        const oaResult = await searchOpenAlex(fallbackSearchTitle, expectedYear);
 
         if (oaResult) {
             const oaAuthors = oaResult.authors;
-            const oaTitleSim = calculateSimilarity(title, oaResult.title);
+            let oaTitleSim = calculateSimilarity(title, oaResult.title);
+            const normalize = (str: string) => str.toLowerCase().replace(/[^\w\s]/g, '').trim();
+            const nQuery = normalize(title);
+            const nOaTitle = normalize(oaResult.title);
+            if (!expected?.title && nQuery.includes(nOaTitle)) {
+                oaTitleSim = 100;
+            } else if (nQuery.includes(nOaTitle) && oaTitleSim < 95) {
+                oaTitleSim = 95;
+            }
 
-            // If still not found via CrossRef (and SS didn't match), OR OpenAlex has a significantly better title match
+            // If still not found via CrossRef (and SS didn't match), OR OpenAlex has a significantly better title match OR the correct year
             const hasBetterTitle = (oaTitleSim >= 95 && oaTitleSim > crossRefResult.titleMatchScore) || 
                                    (oaTitleSim > crossRefResult.titleMatchScore + 10);
+            const hasCorrectVersion = Boolean(expectedYear && oaResult.year?.toString() === expectedYear && oaTitleSim >= 70);
 
-            if (!crossRefResult.exists || (crossRefResult.matchConfidence < 90 && hasBetterTitle)) {
+            if (!crossRefResult.exists || (crossRefResult.matchConfidence < 90 && (hasBetterTitle || hasCorrectVersion))) {
                 if (oaTitleSim < MIN_TITLE_SIMILARITY) {
                     // Title doesn't match — return Not Found
                     return {
@@ -874,16 +884,6 @@ export const checkWithFallback = async (query: string, expected?: ExpectedMetada
                 }
             }
 
-            // CrossRef has version mismatch — check if OA has the right version
-            if (crossRefResult.issues.some(i => i.toLowerCase().includes('year') || i.toLowerCase().includes('version') || i.toLowerCase().includes('preprint'))) {
-                if (expectedYear && oaResult.year?.toString() === expectedYear) {
-                    crossRefResult.correctedApa = formatOpenAlexAPA(oaResult);
-                    crossRefResult.correctedBibtex = generateOpenAlexBibTeX(oaResult);
-                    crossRefResult.fallbackSource = 'OpenAlex';
-                    crossRefResult.matchConfidence = Math.min(100, crossRefResult.matchConfidence + 15);
-                    return crossRefResult;
-                }
-            }
         }
 
         // If nothing found at all (CrossRef also returned NotFound)
