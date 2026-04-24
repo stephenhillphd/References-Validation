@@ -129,7 +129,7 @@ const extractLikelyTitle = (rawRef: string): string | null => {
 
 // ===== MINIMUM TITLE SIMILARITY TO ACCEPT A RESULT =====
 // Below this threshold, the result is treated as "Not Found" rather than showing a different paper
-const MIN_TITLE_SIMILARITY = 55;
+const MIN_TITLE_SIMILARITY = 90;
 
 // Levenshtein distance for string similarity
 const levenshteinDistance = (a: string, b: string): number => {
