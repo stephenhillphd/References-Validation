@@ -148,6 +148,19 @@ export const CheckResultCard: React.FC<Props> = ({ reference, result, loading })
                                         ))}
                                     </div>
                                 )}
+
+                                {/* Google Scholar button for partial matches */}
+                                {result.matchConfidence <= 80 && (
+                                    <a
+                                        href={getGoogleScholarUrl(reference)}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center space-x-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors mt-1"
+                                    >
+                                        <Search size={14} />
+                                        <span>Search on Google Scholar</span>
+                                    </a>
+                                )}
                             </div>
                         ) : (
                             <div className="space-y-3">

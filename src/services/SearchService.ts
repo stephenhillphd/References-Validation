@@ -538,21 +538,79 @@ export const checkReference = async (rawQuery: string, expected?: ExpectedMetada
                 }
 
                 // ===== DETECT FAKE AUTHORS (Quick Check) =====
-                const queryTokens = validationQuery.split(/[\s,.:;()]+/);
+                // Pre-clean the validation query: remove reference markers, DOI, pages, volume/issue, years
+                let cleanedValidation = validationQuery
+                    .replace(/\[\s*[JMCDRSZN]\s*\]/g, '')          // Chinese-style ref markers: [J], [M], [C], etc.
+                    .replace(/\/\/[^.]+/g, '')                      // Book series after // (e.g. //Handbook of...)
+                    .replace(/DOI\s*[:：]\s*[^\s,]+/gi, '')          // DOI:10.xxx/yyy
+                    .replace(/https?:\/\/[^\s,]+/gi, '')             // URLs
+                    .replace(/\b[Pp]{1,2}\.?\s*\d+[-–]\d+/g, '')   // pp. 123-456
+                    .replace(/\b\d{1,5}\s*[-–]\s*\d{1,5}\b/g, '')  // Page ranges: 517-55
+                    .replace(/\b\d{1,4}\s*\(\d{1,4}\)/g, '')       // Volume(Issue): 26(4)
+                    .replace(/\b[Vv]ol\.?\s*\d+/g, '')              // Vol. 12
+                    .replace(/\b[Nn]o\.?\s*\d+/g, '')               // No. 3
+                    .replace(/\(?\b(19|20)\d{2}\b\)?/g, '')         // Years: (2022), 2022
+                    .replace(/\bet\s+al\.?/gi, '')                  // et al.
+                    .replace(/\s{2,}/g, ' ')                        // Collapse spaces
+                    .trim();
+
+                const queryTokens = cleanedValidation.split(/[\s,.:;()]+/);
                 const potentialFakeAuthors = [];
-                const stopWords = ["vol", "issue", "pp", "doi", "http", "https", "org", "com", "www"];
+                const stopWords = new Set([
+                    // Generic metadata
+                    "vol", "issue", "doi", "http", "https", "org", "com", "www",
+                    "pages", "page", "chapter", "edition", "eds", "editor", "editors",
+                    "proceedings", "conference", "symposium", "workshop", "series",
+                    "isbn", "issn", "abstract", "available", "accessed", "online", "retrieved",
+                    // Publishers
+                    "publishing", "publisher", "publishers", "press", "books",
+                    "springer", "elsevier", "wiley", "routledge", "mcgraw", "pearson",
+                    "academic", "lexington", "edward", "elgar", "sage", "informa",
+                    "palgrave", "macmillan", "kluwer", "emerald", "ieee", "acm",
+                    "taylor", "francis", "dekker", "plenum", "pergamon", "addison",
+                    // University presses and locations
+                    "cambridge", "oxford", "harvard", "princeton", "stanford", "chicago",
+                    "columbia", "yale", "university", "institute", "school",
+                    "dordrecht", "netherlands", "london", "york", "berlin", "heidelberg",
+                    // Common reference words
+                    "translated", "revised", "reprint", "forthcoming",
+                    "review", "journal", "annals", "bulletin", "quarterly",
+                    "international", "national", "american", "european", "british",
+                    // Common short title words that get capitalized at start
+                    "from", "with", "than", "into", "upon", "about", "between",
+                    "through", "toward", "towards", "across", "beyond"
+                ]);
+
+                // Also gather the CrossRef publisher name for comparison
+                const resultPublisher = normalize(item.publisher || '');
+                // Get all container-title variants (book series, etc.)
+                const allContainerTitles = (item['container-title'] || []).map((t: string) => normalize(t)).join(' ');
 
                 for (const token of queryTokens) {
                     const nToken = normalize(token);
-                    if (nToken.length < 3) continue;
-                    if (!/^[A-Z]/.test(token)) continue;
-                    if (stopWords.includes(nToken)) continue;
+                    if (nToken.length < 4) continue;                           // Skip short tokens (initials, "et", "al")
+                    if (!/^[A-Z]/.test(token)) continue;                        // Only check capitalized tokens
+                    if (/^\d+$/.test(token)) continue;                         // Skip pure numbers
+                    if (stopWords.has(nToken)) continue;                        // Skip known non-author words
 
+                    // Check against result title
                     if (nResultTitle.includes(nToken)) continue;
+                    // Check against result journal
                     if (resultJournal && normalize(resultJournal).includes(nToken)) continue;
+                    // Check against result year
                     if (resultYear && resultYear.includes(token)) continue;
+                    // Check against publisher
+                    if (resultPublisher && resultPublisher.includes(nToken)) continue;
+                    // Check against all container titles (book series, etc.)
+                    if (allContainerTitles && allContainerTitles.includes(nToken)) continue;
 
-                    const isRealAuthorFamily = realAuthorFamilies.some(real => real.includes(nToken) || nToken.includes(real));
+                    // Check if it's a real author (family name) — also check substrings for compound names
+                    // e.g. "Silva" should match "da Silva Meireles"
+                    const isRealAuthorFamily = realAuthorFamilies.some(real => 
+                        real.includes(nToken) || nToken.includes(real) || 
+                        // Also check individual words of multi-word family names
+                        real.split(/\s+/).some(part => part === nToken || nToken === part)
+                    );
                     const isRealAuthorGiven = realAuthorGivens.some(given => firstLetterMatches(token, given));
 
                     if (!isRealAuthorFamily && !isRealAuthorGiven) {
@@ -605,10 +663,14 @@ export const checkReference = async (rawQuery: string, expected?: ExpectedMetada
                             // Preprint version difference
                             issues.push(`Note: year ${yearsInQuery[0]} vs ${resultYear} (preprint/published version difference)`);
                             overallSim -= 5; // Very mild penalty
-                        } else if (yearDiff === 1 && titleSim > 80) {
+                        } else if (yearDiff === 1 && titleSim > 70) {
                             // Likely version difference even without explicit preprint label
                             issues.push(`Year differs by 1: you wrote ${yearsInQuery[0]}, actual is ${resultYear} (possible version difference)`);
                             overallSim -= 10;
+                        } else if (yearDiff <= 2 && titleSim > 85) {
+                            // 2-year difference with very high title match — likely publication lag
+                            issues.push(`Year differs by ${yearDiff}: you wrote ${yearsInQuery[0]}, actual is ${resultYear} (possible version difference)`);
+                            overallSim -= 15;
                         } else {
                             issues.push(`Year Mismatch: you wrote ${yearsInQuery[0]}, actual is ${resultYear}`);
                             overallSim -= 25;
