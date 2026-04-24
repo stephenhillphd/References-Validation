@@ -771,154 +771,164 @@ export const checkReference = async (rawQuery: string, expected?: ExpectedMetada
 };
 
 /**
- * Helper to normalize author names for comparison
+ * Compute a unified title similarity score, handling both Quick Check (title in query) and Batch (explicit expected title).
  */
-const normalizeAuthorName = (name: string): string => {
-    return name.toLowerCase().replace(/[^a-z\s]/g, '').trim();
+const computeTitleSim = (title: string, resultTitle: string, expected?: ExpectedMetadata, query?: string): number => {
+    const normalize = (str: string) => str.toLowerCase().replace(/[^\w\s]/g, '').trim();
+    let sim = 0;
+    if (expected?.title) {
+        sim = calculateSimilarity(expected.title, resultTitle);
+    } else {
+        const nQuery = normalize(query || title);
+        const nResultTitle = normalize(resultTitle);
+        if (nQuery.includes(nResultTitle)) {
+            sim = 100;
+        } else if (nResultTitle.includes(nQuery)) {
+            sim = 95;
+        } else {
+            sim = calculateSimilarity(query || title, resultTitle);
+        }
+    }
+    return sim;
 };
 
 /**
- * Compare authors between sources - returns true if authors match well
+ * Score a candidate result from any source. Higher = better.
+ * Considers title similarity, year match, and journal match.
  */
-const authorsMatch = (source1Authors: string[], source2Authors: string[]): boolean => {
-    if (source1Authors.length === 0 || source2Authors.length === 0) return false;
+const scoreCandidateResult = (
+    titleSim: number,
+    resultYear: string | undefined,
+    resultJournal: string | undefined,
+    expectedYear: string | undefined,
+    expectedJournal: string | undefined
+): number => {
+    let score = titleSim * 3; // Title is most important
 
-    const norm1 = source1Authors.map(normalizeAuthorName);
-    const norm2 = source2Authors.map(normalizeAuthorName);
-
-    // Check if at least 50% of authors from source1 are in source2
-    let matches = 0;
-    for (const author of norm1) {
-        const lastName = author.split(' ').pop() || author;
-        if (norm2.some(a2 => a2.includes(lastName) || lastName.includes(a2.split(' ').pop() || ''))) {
-            matches++;
+    if (expectedYear && resultYear) {
+        if (resultYear === expectedYear) {
+            score += 40;
+        } else if (Math.abs(parseInt(expectedYear) - parseInt(resultYear)) <= 1) {
+            score += 15;
+        } else if (Math.abs(parseInt(expectedYear) - parseInt(resultYear)) <= 2) {
+            score += 5;
         }
     }
 
-    return matches >= Math.ceil(source1Authors.length / 2);
+    if (expectedJournal && resultJournal) {
+        const jSim = calculateSimilarity(expectedJournal, resultJournal);
+        score += Math.round(jSim * 0.3);
+    }
+
+    return score;
 };
 
 /**
- * Check reference with fallback to Semantic Scholar and OpenAlex
- * If CrossRef finds issues, verify with other sources
- * If they confirm correct data, provide corrected APA/BibTeX
+ * Check reference against ALL THREE sources simultaneously (CrossRef, Semantic Scholar, OpenAlex).
+ * Picks the best result across all sources using a unified scoring function.
  */
 export const checkWithFallback = async (query: string, expected?: ExpectedMetadata, originalQuery?: string): Promise<CheckResult> => {
-    // First, try CrossRef with the full query
-    // Pass originalQuery for validation so that even retries validate against the full original text
-    let crossRefResult = await checkReference(query, expected, originalQuery);
+    const title = expected?.title || query;
 
-    // If not found, low confidence (< 90%), or has issues, try fallback sources
-    if (!crossRefResult.exists || crossRefResult.matchConfidence < 90 || crossRefResult.issues.length > 0) {
-        const title = expected?.title || query;
+    // Extract expected year from query if not explicitly provided
+    const extractSource = originalQuery || query;
+    const extractedYears = !expected?.year ? Array.from(extractSource.match(/\b(19|20)\d{2}\b/g) || []) : [];
+    const expectedYear = expected?.year || (extractedYears.length > 0 ? String(extractedYears[0]) : undefined);
+    const expectedJournal = expected?.journal;
 
-        // Try to extract expected year from query if not explicitly provided
-        const extractSource = originalQuery || query;
-        const extractedYears = !expected?.year ? Array.from(extractSource.match(/\b(19|20)\d{2}\b/g) || []) : [];
-        const expectedYear = expected?.year || (extractedYears.length > 0 ? String(extractedYears[0]) : undefined);
+    // Determine search title for SS/OA (clean it up for better API results)
+    const fallbackSearchTitle = expected?.title || extractLikelyTitle(query) || query;
 
-        // Clean up title for fallback API queries to avoid 400 errors and improve relevance
-        // If CrossRef already found a result, use its perfectly extracted clean title!
-        const fallbackSearchTitle = crossRefResult.exists && crossRefResult.title 
-            ? crossRefResult.title 
-            : (expected?.title ? expected.title : (extractLikelyTitle(query) || title));
+    // ===== QUERY ALL THREE SOURCES IN PARALLEL =====
+    const [crossRefResult, ssResult, oaResult] = await Promise.all([
+        checkReference(query, expected, originalQuery),
+        searchSemanticScholar(fallbackSearchTitle, expectedYear).catch(() => null),
+        searchOpenAlex(fallbackSearchTitle, expectedYear).catch(() => null)
+    ]);
 
-        // Try Semantic Scholar (pass expectedYear for version-aware selection)
-        const ssResult = await searchSemanticScholar(fallbackSearchTitle, expectedYear);
+    // ===== BUILD CANDIDATE LIST =====
+    interface Candidate {
+        source: 'CrossRef' | 'SemanticScholar' | 'OpenAlex';
+        result: CheckResult;
+        score: number;
+        titleSim: number;
+    }
 
-        if (ssResult) {
-            const ssAuthors = ssResult.authors;
-            let ssTitleSim = calculateSimilarity(title, ssResult.title);
-            const normalize = (str: string) => str.toLowerCase().replace(/[^\w\s]/g, '').trim();
-            const nQuery = normalize(title);
-            const nSsTitle = normalize(ssResult.title);
-            if (!expected?.title && nQuery.includes(nSsTitle)) {
-                ssTitleSim = 100;
-            } else if (nQuery.includes(nSsTitle) && ssTitleSim < 95) {
-                ssTitleSim = 95;
-            }
+    const candidates: Candidate[] = [];
 
-            // If CrossRef wasn't found, OR Semantic Scholar has a significantly better title match OR it has the correct year version
-            const hasBetterTitle = (ssTitleSim >= 95 && ssTitleSim > crossRefResult.titleMatchScore) || 
-                                   (ssTitleSim > crossRefResult.titleMatchScore + 10);
-            const hasCorrectVersion = Boolean(expectedYear && ssResult.year?.toString() === expectedYear && ssTitleSim >= 70);
+    // --- CrossRef candidate ---
+    if (crossRefResult.exists) {
+        candidates.push({
+            source: 'CrossRef',
+            result: crossRefResult,
+            score: scoreCandidateResult(
+                crossRefResult.titleMatchScore,
+                crossRefResult.year,
+                crossRefResult.journal,
+                expectedYear,
+                expectedJournal
+            ),
+            titleSim: crossRefResult.titleMatchScore
+        });
+    }
 
-            if (!crossRefResult.exists || (crossRefResult.matchConfidence < 90 && (hasBetterTitle || hasCorrectVersion))) {
-                if (ssTitleSim < MIN_TITLE_SIMILARITY) {
-                    // Title doesn't match well enough — don't show a wrong paper
-                    // Continue to try OpenAlex
-                } else {
-                    return {
-                        exists: true,
-                        title: ssResult.title,
-                        authors: ssAuthors.join(', '),
-                        year: ssResult.year?.toString() || '',
-                        journal: ssResult.venue,
-                        url: ssResult.url,
-                        doi: ssResult.externalIds?.DOI,
-                        apa: formatSemanticScholarAPA(ssResult),
-                        bibtex: generateSemanticScholarBibTeX(ssResult),
-                        source: 'SemanticScholar',
-                        matchConfidence: Math.min(95, ssTitleSim + 10),
-                        titleMatchScore: ssTitleSim,
-                        authorMatchScore: 100,
-                        journalMatchScore: ssResult.venue ? 90 : 50,
-                        issues: !crossRefResult.exists ? [] : [`Better match found in Semantic Scholar (CrossRef confidence was ${crossRefResult.matchConfidence}%)`]
-                    };
-                }
-            }
+    // --- Semantic Scholar candidate ---
+    if (ssResult) {
+        const ssTitleSim = computeTitleSim(title, ssResult.title, expected, query);
 
-            // CrossRef found but has issues - check if Semantic Scholar confirms different authors
-            if (crossRefResult.exists && expected?.authors) {
-                const expectedAuthorList = expected.authors.split(/[,&]|and/i).map(a => a.trim());
+        if (ssTitleSim >= MIN_TITLE_SIMILARITY) {
+            const ssScore = scoreCandidateResult(
+                ssTitleSim,
+                ssResult.year?.toString(),
+                ssResult.venue,
+                expectedYear,
+                expectedJournal
+            );
 
-                if (!authorsMatch(expectedAuthorList, ssAuthors) && authorsMatch((crossRefResult.authors || '').split(', '), ssAuthors)) {
-                    crossRefResult.correctedApa = formatSemanticScholarAPA(ssResult);
-                    crossRefResult.correctedBibtex = generateSemanticScholarBibTeX(ssResult);
-                    crossRefResult.fallbackSource = 'SemanticScholar';
-                    return crossRefResult;
-                }
-            }
+            candidates.push({
+                source: 'SemanticScholar',
+                result: {
+                    exists: true,
+                    title: ssResult.title,
+                    authors: ssResult.authors.join(', '),
+                    year: ssResult.year?.toString() || '',
+                    journal: ssResult.venue,
+                    url: ssResult.url,
+                    doi: ssResult.externalIds?.DOI,
+                    apa: formatSemanticScholarAPA(ssResult),
+                    bibtex: generateSemanticScholarBibTeX(ssResult),
+                    source: 'SemanticScholar',
+                    matchConfidence: Math.min(95, ssTitleSim + 10),
+                    titleMatchScore: ssTitleSim,
+                    authorMatchScore: 100,
+                    journalMatchScore: ssResult.venue ? 90 : 50,
+                    issues: []
+                },
+                score: ssScore,
+                titleSim: ssTitleSim
+            });
         }
+    }
 
-        // Try OpenAlex (pass expectedYear for version-aware selection)
-        const oaResult = await searchOpenAlex(fallbackSearchTitle, expectedYear);
+    // --- OpenAlex candidate ---
+    if (oaResult) {
+        const oaTitleSim = computeTitleSim(title, oaResult.title, expected, query);
 
-        if (oaResult) {
-            const oaAuthors = oaResult.authors;
-            let oaTitleSim = calculateSimilarity(title, oaResult.title);
-            const normalize = (str: string) => str.toLowerCase().replace(/[^\w\s]/g, '').trim();
-            const nQuery = normalize(title);
-            const nOaTitle = normalize(oaResult.title);
-            if (!expected?.title && nQuery.includes(nOaTitle)) {
-                oaTitleSim = 100;
-            } else if (nQuery.includes(nOaTitle) && oaTitleSim < 95) {
-                oaTitleSim = 95;
-            }
+        if (oaTitleSim >= MIN_TITLE_SIMILARITY) {
+            const oaScore = scoreCandidateResult(
+                oaTitleSim,
+                oaResult.year?.toString(),
+                oaResult.journal,
+                expectedYear,
+                expectedJournal
+            );
 
-            // If still not found via CrossRef (and SS didn't match), OR OpenAlex has a significantly better title match OR the correct year
-            const hasBetterTitle = (oaTitleSim >= 95 && oaTitleSim > crossRefResult.titleMatchScore) || 
-                                   (oaTitleSim > crossRefResult.titleMatchScore + 10);
-            const hasCorrectVersion = Boolean(expectedYear && oaResult.year?.toString() === expectedYear && oaTitleSim >= 70);
-
-            if (!crossRefResult.exists || (crossRefResult.matchConfidence < 90 && (hasBetterTitle || hasCorrectVersion))) {
-                if (oaTitleSim < MIN_TITLE_SIMILARITY) {
-                    // Title doesn't match — return Not Found
-                    return {
-                        exists: false,
-                        source: 'NotFound',
-                        matchConfidence: 0,
-                        titleMatchScore: Math.max(crossRefResult.titleMatchScore, oaTitleSim),
-                        authorMatchScore: 0,
-                        journalMatchScore: 0,
-                        issues: ['Title not found in any source (CrossRef, Semantic Scholar, OpenAlex)']
-                    };
-                }
-
-                return {
+            candidates.push({
+                source: 'OpenAlex',
+                result: {
                     exists: true,
                     title: oaResult.title,
-                    authors: oaAuthors.join(', '),
+                    authors: oaResult.authors.join(', '),
                     year: oaResult.year?.toString() || '',
                     journal: oaResult.journal,
                     url: oaResult.url,
@@ -930,52 +940,60 @@ export const checkWithFallback = async (query: string, expected?: ExpectedMetada
                     titleMatchScore: oaTitleSim,
                     authorMatchScore: 100,
                     journalMatchScore: oaResult.journal ? 85 : 50,
-                    issues: !crossRefResult.exists ? [] : [`Better match found in OpenAlex (CrossRef confidence was ${crossRefResult.matchConfidence}%)`]
-                };
-            }
-
-            // CrossRef found but has issues - check if OpenAlex confirms different authors
-            if (expected?.authors) {
-                const expectedAuthorList = expected.authors.split(/[,&]|and/i).map(a => a.trim());
-
-                if (!authorsMatch(expectedAuthorList, oaAuthors) && authorsMatch((crossRefResult.authors || '').split(', '), oaAuthors)) {
-                    crossRefResult.correctedApa = formatOpenAlexAPA(oaResult);
-                    crossRefResult.correctedBibtex = generateOpenAlexBibTeX(oaResult);
-                    crossRefResult.fallbackSource = 'OpenAlex';
-                    return crossRefResult;
-                }
-            }
-
-        }
-
-        // If nothing found at all (CrossRef also returned NotFound)
-        if (!crossRefResult.exists) {
-            // ===== RETRY WITH EXTRACTED TITLE =====
-            // If the full query failed (likely because it contains author names, pages, etc.),
-            // try extracting just the title and searching again
-            if (!expected?.title) {
-                const extractedTitle = extractLikelyTitle(query);
-                if (extractedTitle && extractedTitle !== query) {
-                    console.log(`[Retry] Full query failed, retrying with extracted title: "${extractedTitle}"`);
-                    // Pass the ORIGINAL full query so validation still checks against the full text
-                    const retryResult = await checkWithFallback(extractedTitle, expected, query);
-                    if (retryResult.exists) {
-                        return retryResult;
-                    }
-                }
-            }
-
-            return {
-                exists: false,
-                source: 'NotFound',
-                matchConfidence: 0,
-                titleMatchScore: 0,
-                authorMatchScore: 0,
-                journalMatchScore: 0,
-                issues: ['Title not found in any source (CrossRef, Semantic Scholar, OpenAlex)']
-            };
+                    issues: []
+                },
+                score: oaScore,
+                titleSim: oaTitleSim
+            });
         }
     }
 
-    return crossRefResult;
+    // ===== PICK THE BEST CANDIDATE =====
+    if (candidates.length > 0) {
+        candidates.sort((a, b) => b.score - a.score);
+        const best = candidates[0];
+
+        // If CrossRef won, return its full result (which includes complete validation/issues)
+        if (best.source === 'CrossRef') {
+            // But check if SS or OA had a better match that CrossRef missed
+            // (only override if the other source is significantly better)
+            const otherBest = candidates.find(c => c.source !== 'CrossRef');
+            if (otherBest && otherBest.score > best.score) {
+                // This shouldn't happen since we sorted, but safety check
+                const winner = otherBest.result;
+                winner.issues = [`Better match found in ${otherBest.source} (CrossRef confidence was ${best.result.matchConfidence}%)`];
+                return winner;
+            }
+            return crossRefResult;
+        }
+
+        // Non-CrossRef source won — add context about where it came from
+        const winner = best.result;
+        if (crossRefResult.exists) {
+            winner.issues = [`Better match found in ${best.source} (CrossRef confidence was ${crossRefResult.matchConfidence}%)`];
+        }
+        return winner;
+    }
+
+    // ===== NO CANDIDATES FOUND — RETRY WITH EXTRACTED TITLE =====
+    if (!expected?.title) {
+        const extractedTitle = extractLikelyTitle(query);
+        if (extractedTitle && extractedTitle !== query) {
+            console.log(`[Retry] All sources failed, retrying with extracted title: "${extractedTitle}"`);
+            const retryResult = await checkWithFallback(extractedTitle, expected, query);
+            if (retryResult.exists) {
+                return retryResult;
+            }
+        }
+    }
+
+    return {
+        exists: false,
+        source: 'NotFound',
+        matchConfidence: 0,
+        titleMatchScore: 0,
+        authorMatchScore: 0,
+        journalMatchScore: 0,
+        issues: ['Title not found in any source (CrossRef, Semantic Scholar, OpenAlex)']
+    };
 };
